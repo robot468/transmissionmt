@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cerrno> // for ENOENT
+#include <deque>
+#include <future>
 #include <optional>
 #include <set>
 #include <string>
@@ -71,11 +73,12 @@ void walkTree(std::string_view const top, std::string_view const subpath, std::s
     auto const info = tr_sys_path_get_info(path, 0, &error);
     if (error != nullptr)
     {
-        tr_logAddWarn(fmt::format(
-            _("Skipping '{path}': {error} ({error_code})"),
-            fmt::arg("path", path),
-            fmt::arg("error", error->message),
-            fmt::arg("error_code", error->code)));
+        tr_logAddWarn(
+            fmt::format(
+                _("Skipping '{path}': {error} ({error_code})"),
+                fmt::arg("path", path),
+                fmt::arg("error", error->message),
+                fmt::arg("error_code", error->code)));
         tr_error_free(error);
     }
     if (!info)
@@ -182,7 +185,9 @@ bool tr_metainfo_builder::blockingMakeChecksums(tr_error** error)
 
     auto hashes = std::vector<std::byte>(std::size(tr_sha1_digest_t{}) * pieceCount());
     auto* walk = std::data(hashes);
-    auto sha = tr_sha1::create();
+
+    auto const max_workers = std::max<uint32_t>(1U, std::thread::hardware_concurrency());
+    auto futures = std::deque<std::future<tr_sha1_digest_t>>{};
 
     auto file_index = tr_file_index_t{ 0U };
     auto piece_index = tr_piece_index_t{ 0U };
@@ -246,13 +251,34 @@ bool tr_metainfo_builder::blockingMakeChecksums(tr_error** error)
 
         TR_ASSERT(bufptr - std::data(buf) == (int)piece_size);
         TR_ASSERT(left_in_piece == 0);
-        sha->add(std::data(buf), std::size(buf));
-        auto const digest = sha->finish();
-        walk = std::copy(std::begin(digest), std::end(digest), walk);
-        sha->clear();
+
+        auto piece_data = std::vector<char>(std::begin(buf), std::end(buf));
+        futures.emplace_back(
+            std::async(
+                std::launch::async,
+                [data = std::move(piece_data)]() mutable
+                {
+                    auto sha_local = tr_sha1::create();
+                    sha_local->add(std::data(data), std::size(data));
+                    return sha_local->finish();
+                }));
+
+        if (std::size(futures) >= max_workers)
+        {
+            auto const digest = futures.front().get();
+            futures.pop_front();
+            walk = std::copy(std::begin(digest), std::end(digest), walk);
+        }
 
         total_remain -= piece_size;
         ++piece_index;
+    }
+
+    while (!std::empty(futures))
+    {
+        auto const digest = futures.front().get();
+        futures.pop_front();
+        walk = std::copy(std::begin(digest), std::end(digest), walk);
     }
 
     TR_ASSERT(cancel_ || size_t(walk - std::data(hashes)) == std::size(hashes));
