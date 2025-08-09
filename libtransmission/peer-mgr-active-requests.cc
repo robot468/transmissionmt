@@ -7,9 +7,11 @@
 #include <ctime>
 #include <memory>
 #include <utility>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <shared_mutex>
 
 #define LIBTRANSMISSION_PEER_MODULE
 
@@ -59,6 +61,8 @@ struct PeerAtHash
 class ActiveRequests::Impl
 {
 public:
+    mutable std::shared_mutex mutex_;
+
     size_t size() const
     {
         return size_;
@@ -110,6 +114,7 @@ ActiveRequests::~ActiveRequests() = default;
 
 bool ActiveRequests::add(tr_block_index_t block, tr_peer* peer, time_t when)
 {
+    auto lock = std::unique_lock<std::shared_mutex>{ impl_->mutex_ };
     bool const added = impl_->blocks_[block].emplace(peer, when).second;
 
     if (added)
@@ -123,6 +128,7 @@ bool ActiveRequests::add(tr_block_index_t block, tr_peer* peer, time_t when)
 // remove a request to `peer` for `block`
 bool ActiveRequests::remove(tr_block_index_t block, tr_peer const* peer)
 {
+    auto lock = std::unique_lock<std::shared_mutex>{ impl_->mutex_ };
     auto const it = impl_->blocks_.find(block);
     auto const key = peer_at{ const_cast<tr_peer*>(peer), 0 };
     auto const removed = it != std::end(impl_->blocks_) && it->second.erase(key) != 0;
@@ -144,14 +150,17 @@ bool ActiveRequests::remove(tr_block_index_t block, tr_peer const* peer)
 std::vector<tr_block_index_t> ActiveRequests::remove(tr_peer const* peer)
 {
     auto removed = std::vector<tr_block_index_t>{};
-    removed.reserve(impl_->blocks_.size());
-
-    auto const key = peer_at{ const_cast<tr_peer*>(peer), 0 };
-    for (auto const& [block, peers_at] : impl_->blocks_)
     {
-        if (peers_at.count(key) != 0U)
+        auto lock = std::shared_lock<std::shared_mutex>{ impl_->mutex_ };
+        removed.reserve(impl_->blocks_.size());
+
+        auto const key = peer_at{ const_cast<tr_peer*>(peer), 0 };
+        for (auto const& [block, peers_at] : impl_->blocks_)
         {
-            removed.push_back(block);
+            if (peers_at.count(key) != 0U)
+            {
+                removed.push_back(block);
+            }
         }
     }
 
@@ -167,17 +176,20 @@ std::vector<tr_block_index_t> ActiveRequests::remove(tr_peer const* peer)
 std::vector<tr_peer*> ActiveRequests::remove(tr_block_index_t block)
 {
     auto removed = std::vector<tr_peer*>{};
-
-    if (auto it = impl_->blocks_.find(block); it != std::end(impl_->blocks_))
     {
-        auto const n = std::size(it->second);
-        removed.resize(n);
-        std::transform(
-            std::begin(it->second),
-            std::end(it->second),
-            std::begin(removed),
-            [](auto const& sent) { return sent.peer; });
-        impl_->blocks_.erase(block);
+        auto lock = std::unique_lock<std::shared_mutex>{ impl_->mutex_ };
+
+        if (auto it = impl_->blocks_.find(block); it != std::end(impl_->blocks_))
+        {
+            auto const n = std::size(it->second);
+            removed.resize(n);
+            std::transform(
+                std::begin(it->second),
+                std::end(it->second),
+                std::begin(removed),
+                [](auto const& sent) { return sent.peer; });
+            impl_->blocks_.erase(block);
+        }
     }
 
     for (auto const* const peer : removed)
@@ -191,6 +203,7 @@ std::vector<tr_peer*> ActiveRequests::remove(tr_block_index_t block)
 // return true if there's an active request to `peer` for `block`
 bool ActiveRequests::has(tr_block_index_t block, tr_peer const* peer) const
 {
+    auto lock = std::shared_lock<std::shared_mutex>{ impl_->mutex_ };
     auto const it = impl_->blocks_.find(block);
     return it != std::end(impl_->blocks_) && (it->second.count(peer_at{ const_cast<tr_peer*>(peer), 0 }) != 0U);
 }
@@ -198,26 +211,29 @@ bool ActiveRequests::has(tr_block_index_t block, tr_peer const* peer) const
 // count how many peers we're asking for `block`
 size_t ActiveRequests::count(tr_block_index_t block) const
 {
-    auto const& blocks = impl_->blocks_;
-    auto const iter = blocks.find(block);
-    return iter == std::end(blocks) ? 0U : std::size(iter->second);
+    auto lock = std::shared_lock<std::shared_mutex>{ impl_->mutex_ };
+    auto const iter = impl_->blocks_.find(block);
+    return iter == std::end(impl_->blocks_) ? 0U : std::size(iter->second);
 }
 
 // count how many active block requests we have to `peer`
 size_t ActiveRequests::count(tr_peer const* peer) const
 {
+    auto lock = std::shared_lock<std::shared_mutex>{ impl_->mutex_ };
     return impl_->count(peer);
 }
 
 // return the total number of active requests
 size_t ActiveRequests::size() const
 {
+    auto lock = std::shared_lock<std::shared_mutex>{ impl_->mutex_ };
     return impl_->size();
 }
 
 // returns the active requests sent before `when`
 std::vector<std::pair<tr_block_index_t, tr_peer*>> ActiveRequests::sentBefore(time_t when) const
 {
+    auto lock = std::shared_lock<std::shared_mutex>{ impl_->mutex_ };
     auto sent_before = std::vector<std::pair<tr_block_index_t, tr_peer*>>{};
     sent_before.reserve(std::size(impl_->blocks_));
 
